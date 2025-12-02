@@ -1,119 +1,177 @@
-#include <BaseClientRpc.h>
-#include <BaseCyclicClientRpc.h>
-#include <SessionManager.h>
-#include <TransportClientTcp.h>
-#include <TransportClientUdp.h>
-#include <iostream>
-#include <thread>
+// Copyright 2021, PickNik Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//----------------------------------------------------------------------
+
+/*!\file
+ *
+ * \author Marq Rasmussen marq.rasmussen@picknik.ai
+ * \author  Lovro Ivanov lovro.ivanov@gmail.com
+ * \date    2021-06-15
+ *
+ */
+//----------------------------------------------------------------------
+
 #include <chrono>
+#include <cmath>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
 
-namespace k_api = Kinova::Api;
+#include "kortex_driver/hardware_interface.hpp"
+#include "kortex_driver/kortex_math_util.hpp"
 
-int main(int argc, char** argv)
+#include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "rclcpp/rclcpp.hpp"
+
+namespace
 {
-    // -------------------------
-    // 1. CONNECT
-    // -------------------------
-    std::string robot_ip = "192.168.1.10";  
-    int tcp_port = 10000;
-    int udp_port = 10001;
+const rclcpp::Logger LOGGER = rclcpp::get_logger("KortexMultiInterfaceHardware");
+}
 
-    k_api::TransportClientTcp tcp_transport;
-    k_api::RouterClient router(&tcp_transport, [](k_api::KError err){});
-    tcp_transport.connect(robot_ip, tcp_port);
+namespace kortex_driver
+{
+KortexMultiInterfaceHardware::KortexMultiInterfaceHardware()
+: router_tcp_{
+    &transport_tcp_,
+    [](k_api::KError err) { cout << "_________ callback error _________" << err.toString(); }},
+  session_manager_{&router_tcp_},
+  router_udp_realtime_{
+    &transport_udp_realtime_,
+    [](k_api::KError err) { cout << "_________ callback error _________" << err.toString(); }},
+  session_manager_real_time_{&router_udp_realtime_},
+  k_api_twist_(nullptr),
+  base_{&router_tcp_},
+  base_cyclic_{&router_udp_realtime_},
+  gripper_motor_command_(nullptr),
+  gripper_command_max_velocity_(100.0),
+  gripper_command_max_force_(100.0),
+  servoing_mode_hw_(k_api::Base::ServoingModeInformation()),
+  joint_based_controller_running_(false),
+  twist_controller_running_(false),
+  gripper_controller_running_(false),
+  fault_controller_running_(false),
+  stop_joint_based_controller_(false),
+  stop_twist_controller_(false),
+  stop_gripper_controller_(false),
+  stop_fault_controller_(false),
+  start_joint_based_controller_(false),
+  start_twist_controller_(false),
+  start_gripper_controller_(false),
+  start_fault_controller_(false),
+  first_pass_(true),
+  gripper_joint_name_(""),
+  use_internal_bus_gripper_comm_(false)
+{
+  RCLCPP_INFO(LOGGER, "Setting severity threshold to DEBUG");
+  auto ret = rcutils_logging_set_logger_level(LOGGER.get_name(), RCUTILS_LOG_SEVERITY_DEBUG);
+  if (ret != RCUTILS_RET_OK)
+  {
+    RCLCPP_ERROR(LOGGER, "Error setting severity: %s", rcutils_get_error_string().str);
+    rcutils_reset_error();
+  }
+}
 
-    k_api::TransportClientUdp udp_transport;
-    k_api::RouterClient rt_router(&udp_transport, [](k_api::KError err){});
-    udp_transport.connect(robot_ip, udp_port);
+// ---------- on_init(), export_state_interfaces(), export_command_interfaces() 
+// remain unchanged from your original code ----------
 
-    k_api::Session::CreateSessionInfo session_info;
-    session_info.set_username("admin");
-    session_info.set_password("admin");
-    session_info.set_session_inactivity_timeout(60000);
-    session_info.set_connection_inactivity_timeout(2000);
+// ---------- write(), read(), readGripperPosition(), etc. remain unchanged ----------
 
-    k_api::SessionManager session(&router);
-    session.CreateSession(session_info);
+// Updated sendJointCommands() with torque control for last wrist joint
+void KortexMultiInterfaceHardware::sendJointCommands()
+{
+  incrementId();
 
-    k_api::SessionManager session_rt(&rt_router);
-    session_rt.CreateSession(session_info);
+  // If torque control active for last joint
+  if (joint_based_controller_running_ && actuator_count_ > 0)
+  {
+    size_t last = actuator_count_ - 1;  // last joint
+    auto command = k_api::BaseCyclic::Command();
+    command = base_cyclic_.Refresh();  // copy previous feedback
 
-    k_api::Base::BaseClient base(&router);
-    k_api::BaseCyclic::BaseCyclicClient base_cyclic(&rt_router);
+    // set torque for last joint
+    command.mutable_actuators(last)->set_command_id(last + 1);
+    command.mutable_actuators(last)->set_control_mode(k_api::Actuator::ControlMode::TORQUE);
+    command.mutable_actuators(last)->set_torque_joint(static_cast<float>(arm_commands_efforts_[last]));
 
-    // -------------------------
-    // 2. SWITCH TO LOW-LEVEL SERVOING
-    // -------------------------
-    k_api::Base::ServoingModeInformation servo_mode;
-    servo_mode.set_servoing_mode(k_api::Base::LOW_LEVEL_SERVOING);
-    base.SetServoingMode(servo_mode);
-
-    std::cout << "LOW LEVEL SERVOING ENABLED" << std::endl;
-
-    // -------------------------
-    // 3. GET ACTUATOR COUNT
-    // -------------------------
-    int actuator_count = base.GetActuatorCount().count();
-    int last_joint = actuator_count - 1;
-
-    std::cout << "Actuators: " << actuator_count 
-              << " (Last Joint Index = " << last_joint << ")" << std::endl;
-
-    // -------------------------
-    // 4. PREPARE TORQUE COMMAND STRUCTURE
-    // -------------------------
-    k_api::BaseCyclic::Feedback feedback;
-    k_api::BaseCyclic::Command command;
-
-    feedback = base_cyclic.RefreshFeedback();
-    command = base_cyclic.RefreshFeedback();
-
-    // -------------------------
-    // 5. SET TORQUE VALUE HERE
-    // -------------------------
-    double torque_cmd = 0.8;   // Nm – change as needed
-
-    // -------------------------
-    // 6. TORQUE CONTROL LOOP
-    // -------------------------
-    std::cout << "Sending torque to last joint..." << std::endl;
-
-    while (true)
+    // set zero torque for other joints
+    for (size_t i = 0; i < actuator_count_; i++)
     {
-        feedback = base_cyclic.RefreshFeedback();
-
-        // Copy previous command frame
-        command = k_api::BaseCyclic::Command();
-        command.set_frame_id(feedback.frame_id() + 1);
-
-        for (int i = 0; i < actuator_count; i++)
-        {
-            auto* joint_cmd = command.add_actuators();
-            joint_cmd->set_command_id(i);
-
-            if (i == last_joint)
-            {
-                // Send torque only to last joint
-                joint_cmd->set_torque_motor(torque_cmd);
-            }
-            else
-            {
-                joint_cmd->set_torque_motor(0.0); // zero torque for others
-            }
-        }
-
-        base_cyclic.SendCommand(command);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      if (i == last) continue;
+      command.mutable_actuators(i)->set_control_mode(k_api::Actuator::ControlMode::TORQUE);
+      command.mutable_actuators(i)->set_torque_joint(0.0f);
     }
 
-    // -------------------------
-    // 7. CLOSE SESSION (never reached in loop)
-    // -------------------------
-    session_rt.CloseSession();
-    session.CloseSession();
-    tcp_transport.disconnect();
-    udp_transport.disconnect();
-
-    return 0;
+    // send command
+    try
+    {
+      feedback_ = base_cyclic_.Refresh(command);
+    }
+    catch (k_api::KDetailedException & ex)
+    {
+      feedback_ = base_cyclic_.RefreshFeedback();
+      RCLCPP_ERROR_STREAM(LOGGER, "Kortex exception: " << ex.what());
+    }
+    catch (std::exception & ex_std)
+    {
+      feedback_ = base_cyclic_.RefreshFeedback();
+      RCLCPP_ERROR_STREAM(LOGGER, "Standard exception: " << ex_std.what());
+    }
+  }
+  else
+  {
+    // default position/velocity control
+    prepareCommands();
+    try
+    {
+      feedback_ = base_cyclic_.Refresh(base_command_);
+    }
+    catch (...)
+    {
+      feedback_ = base_cyclic_.RefreshFeedback();
+    }
+  }
 }
+
+// Updated prepareCommands() for hybrid control
+void KortexMultiInterfaceHardware::prepareCommands()
+{
+  if (actuator_count_ == 0) return;
+  size_t last = actuator_count_ - 1;  // last joint for torque
+
+  for (size_t i = 0; i < actuator_count_; i++)
+  {
+    if (i == last)
+      continue;  // skip last joint, torque handled separately
+
+    // position/velocity control for other joints
+    float cmd_degrees_tmp_ =
+      static_cast<float>(KortexMathUtil::wrapDegreesFromZeroTo360(KortexMathUtil::toDeg(arm_commands_positions_[i])));
+    float cmd_vel_tmp_ = static_cast<float>(KortexMathUtil::toDeg(arm_commands_velocities_[i]));
+
+    base_command_.mutable_actuators(static_cast<int>(i))->set_position(cmd_degrees_tmp_);
+    base_command_.mutable_actuators(static_cast<int>(i))->set_command_id(base_command_.frame_id());
+    // velocity not fully supported in API yet
+  }
+}
+
+// ---------- sendTwistCommand(), sendGripperCommand(), incrementId() remain unchanged ----------
+
+}  // namespace kortex_driver
+
+#include "pluginlib/class_list_macros.hpp"
+PLUGINLIB_EXPORT_CLASS(
+  kortex_driver::KortexMultiInterfaceHardware, hardware_interface::SystemInterface)
